@@ -12,6 +12,9 @@
   上下界两条边后，其余条件对 `end−start` 推出的最紧区间是否完全落入原区间），返回推导界与冗余标记；
   `/reconcile` 在提交各测点实测**读数**后，求让全部测点同时满足
   `|校正坐标 − 读数| ≤ e` 的**最小非负整数 e**，并返回达到该 e 的同一组校正坐标与逐点校正量；
+  `/relax` 在原尺寸链不可行（或任意情况下）把**每条约束的下界减 e、上界加 e**
+  （基准点固定为 0 的钉零关系不参与放宽），求让整条尺寸链可行的**最小非负整数 e**，
+  并返回满足放宽后全部约束的同一组整数坐标与逐条约束的原区间/放宽后区间；
 - **有负环（不可行）**：沿负环累加得到 `0 ≤ 负数` 的矛盾，返回构成该矛盾
   闭环的**原始约束编号**及逐边明细，便于定位尺寸链中的过约束环节。
 
@@ -32,6 +35,7 @@ docker compose up --build -d
 | 测点坐标紧界接口 | `POST http://localhost:8000/api/v1/chains/ranges` |
 | 冗余约束识别接口 | `POST http://localhost:8000/api/v1/chains/redundancy` |
 | 读数最小校正接口 | `POST http://localhost:8000/api/v1/chains/reconcile` |
+| 统一放宽最小 e 接口 | `POST http://localhost:8000/api/v1/chains/relax` |
 | Swagger UI（在线试调） | <http://localhost:8000/docs> |
 | OpenAPI Schema | <http://localhost:8000/openapi.json> |
 
@@ -79,6 +83,11 @@ curl -s -X POST http://localhost:8000/api/v1/chains/reconcile \
   -H 'Content-Type: application/json' \
   -d @examples/reconcile.json | python -m json.tool
 
+# 不可行尺寸链：每条约束下界减 e、上界加 e，求覆盖全部冲突环的最小 e
+curl -s -X POST http://localhost:8000/api/v1/chains/relax \
+  -H 'Content-Type: application/json' \
+  -d @examples/relax.json | python -m json.tool
+
 # 不可行：返回矛盾闭环的约束编号
 curl -s -X POST http://localhost:8000/api/v1/chains/check \
   -H 'Content-Type: application/json' \
@@ -92,11 +101,11 @@ curl -s -X POST http://localhost:8000/api/v1/chains/check \
 
 ## 请求与响应
 
-`/api/v1/chains/check`、`/api/v1/chains/ranges` 与 `/api/v1/chains/redundancy`
-的请求体、静态校验规则（含下文 422 错误码）完全一致；`/reconcile` 在其基础上
-**额外要求** `readings` 字段，其余字段与校验规则沿用。
+`/api/v1/chains/check`、`/api/v1/chains/ranges`、`/api/v1/chains/redundancy`
+与 `/api/v1/chains/relax` 的请求体、静态校验规则（含下文 422 错误码）完全一致；
+`/reconcile` 在其基础上**额外要求** `readings` 字段，其余字段与校验规则沿用。
 
-### 请求体 `POST /api/v1/chains/check`（`/ranges`、`/redundancy` 同）
+### 请求体 `POST /api/v1/chains/check`（`/ranges`、`/redundancy`、`/relax` 同）
 
 ```json
 {
@@ -297,6 +306,81 @@ c1/c2 则 B、C 各为 `[0,10]`，但 c3 要求 `C − B = 5`，跨测点约束�
 `max_abs_correction` 即所有逐点校正量绝对值的最大值；至少有一个测点的校正量
 绝对值等于它（否则 `e−1` 即可行，与最小性矛盾）。
 
+### `POST /api/v1/chains/relax`：统一放宽求最小 e
+
+请求体与 `/check` **完全相同**（同样的字段、同样的静态校验与 422 响应）。
+服务端把**每条约束**统一放宽非负整数 e——区间变为
+`[lower − e, upper + e]`（两条差分边权各恰好增加 e），而**基准点固定为 0 的
+钉零关系不参与放宽**——求让整条尺寸链存在一组整数可行坐标的**最小非负整数
+e**，返回该 e、满足放宽后**全部**约束的**同一组**整数坐标（基准点为 0），
+并按请求 `constraints` 的顺序逐条给出原区间与放宽后区间。原请求可行时
+`e = 0`，放宽区间即原区间。
+
+与 `/check` 等接口不同，`/relax` 对静态校验通过的请求**恒返回 200**：
+放宽量足够大时任何约束冲突都能化解（基准点之间的钉零关系除外——它不放宽，
+但基准点冲突同样可通过放宽产生冲突的约束化解），因此不存在 `infeasible`
+响应；未知点、反向区间、未连通等静态错误仍返回 422。
+
+放宽量对每条约束**一视同仁**，包括没有直接参与任何矛盾环的宽松约束，其区间
+端点同样按 `lower − e`、`upper + e` 如实回显。
+
+请求（`examples/relax.json`，两组只共用基准点 A 的平行精确约束，各自构成
+独立矛盾环：B 同时被要求等于 9 和 5（环需 e≥2），C 同时被要求等于 10 和 3
+（环需 e≥4））：
+
+```json
+{
+  "datum_points": ["A"],
+  "measure_points": ["B", "C"],
+  "constraints": [
+    {"id": "c1", "start": "A", "end": "B", "lower": 9, "upper": 9},
+    {"id": "c2", "start": "A", "end": "B", "lower": 5, "upper": 5},
+    {"id": "c3", "start": "A", "end": "C", "lower": 10, "upper": 10},
+    {"id": "c4", "start": "A", "end": "C", "lower": 3, "upper": 3}
+  ]
+}
+```
+
+响应（HTTP 200）：
+
+```json
+{
+  "status": "feasible",
+  "unit": "um",
+  "relaxation": 4,
+  "coordinates": {"A": 0, "B": 9, "C": 7},
+  "constraints": [
+    {"id": "c1", "start": "A", "end": "B",
+     "original_lower": 9, "original_upper": 9,
+     "relaxed_lower": 5, "relaxed_upper": 13},
+    {"id": "c2", "start": "A", "end": "B",
+     "original_lower": 5, "original_upper": 5,
+     "relaxed_lower": 1, "relaxed_upper": 9},
+    {"id": "c3", "start": "A", "end": "C",
+     "original_lower": 10, "original_upper": 10,
+     "relaxed_lower": 6, "relaxed_upper": 14},
+    {"id": "c4", "start": "A", "end": "C",
+     "original_lower": 3, "original_upper": 3,
+     "relaxed_lower": -1, "relaxed_upper": 7}
+  ]
+}
+```
+
+上例若只按 Bellman–Ford 找到的**首个**矛盾闭环估算只会得到 `e = 2`
+（B 环：`ceil(4/2)`），但 C 环要求 `e ≥ ceil(7/2) = 4`；`/relax` 必须
+**覆盖图中可能出现的全部冲突环**，取各环所需放宽量的最大值，故最小 e 为 4，
+返回坐标 `B = 9、C = 7` 同时落在四条约束放宽后的区间内。`e = 3` 时 C 的两个
+放宽区间 `[7,13]` 与 `[0,6]` 仍不相交，整条链不可行，可据此核对最小性。
+
+| 字段 | 说明 |
+| --- | --- |
+| `relaxation` | 最小非负整数 e（µm），恒 ≥ 0；原请求可行时为 `0` |
+| `coordinates` | 满足放宽后全部约束的**同一组**整数坐标，包含全部基准点（为 `0`）与测点 |
+| `constraints[].id` | 约束原始编号，严格按请求 `constraints` 的顺序列出 |
+| `constraints[].start` / `end` | 该约束的起点 / 终点 |
+| `constraints[].original_lower` / `original_upper` | 原请求给出的整数微米区间 |
+| `constraints[].relaxed_lower` / `relaxed_upper` | 放宽后区间，分别等于 `original_lower − e` 与 `original_upper + e` |
+
 ### 响应二：不可行（HTTP 200）
 
 ```json
@@ -401,6 +485,25 @@ Bellman–Ford）。预计算这三个量（三次 O(|V|·|E|) 松弛，与 `/ra
 后，二分中每次可行性判定只需 O(|V|) 比较；`e*` 下的最短距离
 `min(f(v), h(v) + e*)` 即为达到 e* 的同一组整数校正坐标，逐点校正量为
 `校正坐标 − 读数`。
+
+`/relax` 把统一放宽 e 直接反映到边权：每条约束的两条差分边权各**恰好增加
+e**（`upper→upper+e`、`−lower→−lower+e`），基准点 0 权 pin 边不增加。任意
+含 k 条约束边、原始边权和为 W 的有向环放宽后环权为 `W + k·e`，系统可行当且
+仅当所有环满足 `W + k·e ≥ 0`，故最小放宽量是
+
+> `e* = max(0, max_环 ceil(−W / k))`。
+
+该最大值遍历**全部**有向环，因而天然覆盖多个互不共用约束的冲突环——不能只
+取 Bellman–Ford 检出的首个负环（上例两个独立环分别要求 e≥2 与 e≥4）。计算
+时先把全部基准点按 0 权 pin 边**收缩为同一个 anchor 节点**（pin 边双向 0 权，
+收缩不改变任何含约束边之环的 W 与 k；只含 pin 边的环权恒为 0，永不矛盾），
+收缩图中每条边恰对应一条约束边，问题化为求有向图的**最大平均环**，用 Karp
+动态规划一遍求解：令 F_k(v) 为恰用 k 条边、以 v 结尾的最大走法权重（边权取
+`−w`，所有节点同以 0 初始化，等价于加 0 权超源），则
+`ρ* = max_v min_j (F_n(v) − F_j(v)) / (n − j)`，全程整数运算取
+`e* = max(0, ceil(ρ*))`，复杂度 O(|V|·|E|)，与其余接口同量级。得到 e* 后在
+放宽图上再跑一次 Bellman–Ford，anchor 的最短距离即为满足放宽后全部约束、
+基准点为 0 的同一组整数坐标。
 
 ## 项目结构
 

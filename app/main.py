@@ -20,6 +20,8 @@ from .schemas import (
     ReconcileRequest,
     ReconcileResponse,
     RedundancyResponse,
+    RelaxResponse,
+    RelaxedConstraint,
     ValidationErrorResponse,
 )
 from .solver import (
@@ -30,6 +32,7 @@ from .solver import (
     solve_ranges,
     solve_reconcile,
     solve_redundancy,
+    solve_relax,
 )
 
 logger = logging.getLogger("dimchain")
@@ -39,7 +42,9 @@ app = FastAPI(
     description=(
         "客户端提交基准点、测点及有向尺寸约束（终点减起点的整数微米差上下限），"
         "服务端将界限转为差分约束并判定公差能否同时成立；可行时返回以基准点为零"
-        "的各点坐标，不可行时返回构成矛盾闭环的原始约束编号。"
+        "的各点坐标，不可行时返回构成矛盾闭环的原始约束编号。/relax 在不可行时"
+        "对每条约束统一放宽（下界减 e、上界加 e，基准钉零不放宽），求覆盖全部"
+        "冲突环的最小非负整数 e 及满足放宽后全部约束的同一组整数坐标。"
     ),
     version=__version__,
 )
@@ -186,6 +191,36 @@ def reconcile_chain(req: ReconcileRequest):
         max_abs_correction=result.max_abs_correction,  # type: ignore[arg-type]
         coordinates=result.coordinates,
         corrections=corrections,
+    )
+
+
+@app.post(
+    "/api/v1/chains/relax",
+    response_model=RelaxResponse,
+    summary="求统一放宽量使尺寸链可行",
+    responses={422: {"model": ValidationErrorResponse}},
+    tags=["chains"],
+)
+def relax_chain(req: ChainRequest):
+    result = solve_relax(req)
+
+    # 逐条给出原区间与放宽后区间，按请求 constraints 顺序列出
+    items = [
+        RelaxedConstraint(
+            id=it.cid,
+            start=it.start,
+            end=it.end,
+            original_lower=it.original_lower,
+            original_upper=it.original_upper,
+            relaxed_lower=it.relaxed_lower,
+            relaxed_upper=it.relaxed_upper,
+        )
+        for it in result.relaxed_constraints or []
+    ]
+    return RelaxResponse(
+        relaxation=result.relaxation,  # type: ignore[arg-type]
+        coordinates=result.coordinates,
+        constraints=items,
     )
 
 

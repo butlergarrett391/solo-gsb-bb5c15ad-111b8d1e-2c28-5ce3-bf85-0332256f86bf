@@ -72,6 +72,39 @@ anchor→p 的最短距离给出一组可行坐标，取到读数的最大偏差
 O(|V|) 次比较；e* 下的最短距离
 ``d*(v) = min(f(v), h(v) + e*)`` 即达到 e* 的同一组整数可行校正坐标
 （anchor 及与它 0 权互钉的基准点为 0）。
+
+统一放宽（``solve_relax``）
+---------------------------
+对每条约束统一放宽非负整数 e：区间变为
+``coord(end) − coord(start) ∈ [lower−e, upper+e]``，对应两条差分边
+``start→end`` 权 ``upper+e`` 与 ``end→start`` 权 ``−lower+e``——**每条
+约束边的权都恰好增加 e**。基准点互钉为 0 的 ``datum_pin`` 边权恒为 0，
+**不参与放宽**。
+
+任意有向环 C（含 k_C 条约束边、原始边权和 W_C）放宽后的环权为
+``W_C + k_C·e``，可行 ⇔ 所有环满足 ``W_C + k_C·e ≥ 0``，故最小 e 为
+
+    ``e* = max(0, max_环 C: k_C>0  ceil(−W_C / k_C))``。
+
+只含 datum_pin 边的环对应基准点互钉关系，边权恒为 0（W_C = 0），
+永不矛盾。计算时先把全部基准点按 0 权 pin 边**收缩为同一个 anchor 节点**
+（pin 边双向 0 权，收缩不改变任何含约束边之环的 W_C 与 k_C），收缩图中
+每条边都恰含 1 条约束边（k_C 即环长），问题化为求有向图的**最大平均环**
+``ρ* = max_环 (Σ −w / 环长)``，``e* = max(0, ceil(ρ*))``。
+
+以 Karp 最大平均环的动态规划一次性覆盖**全部**有向环（而非只看 Bellman–
+Ford 找到的某一个矛盾闭环）：令 F_k(v) 为恰用 k 条边、以 v 结尾的最大
+``a(·)`` 权走法之和（边 a(u→v) = −w(u→v)；所有节点同以 0 初始化，
+等价于加一个向各点连 0 权边的超源），递推
+``F_k(v) = max_{u→v} F_{k−1}(u) + a(u→v)``，则
+
+    ``ρ* = max_v min_{0≤j<n} (F_n(v) − F_j(v)) / (n − j)``（n 为收缩后节点数）。
+
+全程整数运算：``e* = max_v min_{0≤j<n} ceil((F_n(v) − F_j(v)) / (n − j))``，
+``ceil(p/q) = −((−p)//q)``，负值项被外层 max 与 0 截掉。本图每条无向约束
+给出双向边且无向连通，收缩图强连通，F_n(v) 必有限。求出 e* 后在放宽图上
+跑一次 Bellman–Ford，anchor 最短距离即为满足放宽后全部约束、基准点为 0
+的同一组整数坐标。
 """
 
 from __future__ import annotations
@@ -113,6 +146,19 @@ class RedundancyItem:
     redundant: bool
 
 
+@dataclass(frozen=True)
+class RelaxedConstraintItem:
+    """单条约束放宽前后的区间（统一放宽量 e）。"""
+
+    cid: str
+    start: str
+    end: str
+    original_lower: int
+    original_upper: int
+    relaxed_lower: int
+    relaxed_upper: int
+
+
 @dataclass
 class SolveResult:
     feasible: bool
@@ -126,6 +172,10 @@ class SolveResult:
     max_abs_correction: int | None = None
     # solve_redundancy 可行时：逐条约束（请求顺序）的推导界与冗余标记
     redundancy: list[RedundancyItem] | None = None
+    # solve_relax 可行时：最小非负整数 e（每条约束统一放宽的微米数）
+    relaxation: int | None = None
+    # solve_relax 可行时：逐条约束（请求顺序）的原区间与放宽后区间
+    relaxed_constraints: list[RelaxedConstraintItem] | None = None
 
 
 def _err(code: str, message: str, location: list, constraint_id: str | None = None) -> dict:
@@ -636,3 +686,119 @@ def _bellman_ford_distances(
         if not changed:
             break
     return dist
+
+
+def _ceil_div(p: int, q: int) -> int:
+    """整数 ceil(p / q)，q > 0；p 可为负（Python // 向下取整）。"""
+    return -((-p) // q)
+
+
+def solve_relax(req: ChainRequest) -> SolveResult:
+    """统一放宽：求让整条尺寸链可行的最小非负整数 e。
+
+    每条约束下界减 e、上界加 e（两条差分边权各恰好 +e），基准点钉零边权恒为
+    0 不放宽。先做与 /check 相同的静态校验；通过后把全部基准点按 0 权 pin 边
+    收缩为同一个 anchor，在收缩图上用 Karp 最大平均环 DP 覆盖**全部**有向环，
+    整数算出 ``e* = max(0, max_v min_j ceil((F_n(v)−F_j(v))/(n−j)))``，
+    再在放宽 e* 的图上跑 Bellman–Ford 取 anchor 最短距离，得到满足放宽后
+    全部约束、基准点为 0 的同一组整数坐标。原请求可行时 e* = 0。
+    """
+    validate_request(req)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    datum_set = set(req.datum_points)
+
+    # 基准点收缩：datum_pin 边双向 0 权，收缩不改变任何含约束边之环的权和与边数
+    repr_of = {p: (anchor if p in datum_set else p) for p in nodes}
+    cnodes = list(dict.fromkeys(repr_of[p] for p in nodes))
+    index = {p: i for i, p in enumerate(cnodes)}
+    n = len(cnodes)
+
+    # Karp DP 的入边表：边 u→v 原始权 w 时 a(u→v) = −w。
+    # upper 边 start→end 权 upper ⇒ a=−upper；
+    # lower 反向边 end→start 权 −lower ⇒ a=lower（datum 端点替换为 anchor）。
+    incoming: list[list[tuple[int, int]]] = [[] for _ in range(n)]
+    for c in req.constraints:
+        u = index[repr_of[c.start]]
+        v = index[repr_of[c.end]]
+        incoming[v].append((u, -c.upper))
+        incoming[u].append((v, c.lower))
+
+    def next_row(prev: list[int | None]) -> list[int | None]:
+        """F_k(v) = max_{u→v} F_{k−1}(u) + a(u→v)；None 表示尚不可达。"""
+        cur: list[int | None] = [None] * n
+        for v in range(n):
+            best: int | None = None
+            for u, a in incoming[v]:
+                pu = prev[u]
+                if pu is None:
+                    continue
+                val = pu + a
+                if best is None or val > best:
+                    best = val
+            cur[v] = best
+        return cur
+
+    # 超源初始化：F_0(v) = 0（等价于加一个向各点连 0 权边的超源点）。
+    # 本图每条无向约束给双向边且无向连通，收缩图强连通，各 F_k(v) 必有限。
+    # 单遍递推保留全部 n+1 行（O(n²) 内存，n≤1000 时可接受），
+    # 随后直接在历史行上取 (F_n−F_j)/(n−j)，无需重跑第二遍。
+    rows: list[list[int | None]] = [[0] * n]
+    for _ in range(n):
+        rows.append(next_row(rows[-1]))
+    f_n = rows[n]
+
+    # e* = max(0, max_v min_{0≤j<n} ceil((F_n(v) − F_j(v)) / (n − j)))
+    e_star = 0
+    for v in range(n):
+        if f_n[v] is None:  # pragma: no cover - 强连通保证 F_n 有限
+            continue
+        best: int | None = None
+        fv_n = int(f_n[v])
+        for j in range(n):
+            fv_j = rows[j][v]
+            if fv_j is None:
+                continue
+            cand = _ceil_div(fv_n - fv_j, n - j)
+            if best is None or cand < best:
+                best = cand
+        if best is not None and best > e_star:
+            e_star = best
+
+    # e* 放宽图：边权 upper+e* / −lower+e*（端点做基准收缩），datum_pin 不放宽。
+    relaxed_edges: list[Edge] = []
+    for c in req.constraints:
+        u = repr_of[c.start]
+        v = repr_of[c.end]
+        relaxed_edges.append(
+            Edge(u, v, c.upper + e_star, c.id, "upper", c.start, c.end)
+        )
+        relaxed_edges.append(
+            Edge(v, u, -c.lower + e_star, c.id, "lower", c.start, c.end)
+        )
+
+    dist, _, bad_edge = _bellman_ford(cnodes, relaxed_edges, anchor)
+    if bad_edge is not None:  # pragma: no cover - e* 由全环公式保证无负环
+        raise RuntimeError("放宽 e* 后仍检测到负环，与最大平均环计算矛盾")
+
+    # anchor 最短距离即满足放宽后全部约束的一组整数坐标；其余基准点固定为 0
+    coordinates: dict[str, int] = {}
+    for p in nodes:
+        coordinates[p] = 0 if p in datum_set else int(dist[repr_of[p]])
+
+    items = [
+        RelaxedConstraintItem(
+            cid=c.id,
+            start=c.start,
+            end=c.end,
+            original_lower=c.lower,
+            original_upper=c.upper,
+            relaxed_lower=c.lower - e_star,
+            relaxed_upper=c.upper + e_star,
+        )
+        for c in req.constraints
+    ]
+    return SolveResult(
+        True, coordinates, [], 0, None, None, None, e_star, items
+    )

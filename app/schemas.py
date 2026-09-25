@@ -241,6 +241,54 @@ class ReconcileResponse(BaseModel):
     )
 
 
+class RelaxedConstraint(BaseModel):
+    """单条约束放宽前后的整数微米区间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: PointId = Field(..., description="约束的原始编号（与请求 constraints 一致）")
+    start: PointId = Field(..., description="该约束的起点")
+    end: PointId = Field(..., description="该约束的终点")
+    original_lower: StrictInt = Field(..., description="原区间下限（整数微米，含端点）")
+    original_upper: StrictInt = Field(..., description="原区间上限（整数微米，含端点）")
+    relaxed_lower: StrictInt = Field(
+        ..., description="放宽后区间下限 = original_lower − e（整数微米，含端点）"
+    )
+    relaxed_upper: StrictInt = Field(
+        ..., description="放宽后区间上限 = original_upper + e（整数微米，含端点）"
+    )
+
+
+class RelaxResponse(BaseModel):
+    """统一放宽 e 后的可行结果：最小非负整数 e、同一组可行整数坐标与逐条区间。"""
+
+    status: Literal["feasible"] = "feasible"
+    unit: Literal["um"] = "um"
+    relaxation: StrictInt = Field(
+        ...,
+        ge=0,
+        description=(
+            "最小的非负整数 e：把每条约束的下界减 e、上界加 e（基准点固定为 0"
+            "的钉零关系不参与放宽）后，存在一组满足全部放宽约束的整数坐标；"
+            "原请求可行时 e = 0"
+        ),
+    )
+    coordinates: dict[PointId, StrictInt] = Field(
+        ...,
+        description=(
+            "满足放宽后全部约束的同一组整数坐标（微米），包含全部基准点（为 0）"
+            "与测点"
+        ),
+    )
+    constraints: list[RelaxedConstraint] = Field(
+        ...,
+        description=(
+            "逐条约束的原区间与放宽后区间，严格按请求 constraints 的顺序列出；"
+            "放宽后区间即 [original_lower − e, original_upper + e]"
+        ),
+    )
+
+
 class InfeasibleResponse(BaseModel):
     status: Literal["infeasible"] = "infeasible"
     unit: Literal["um"] = "um"
